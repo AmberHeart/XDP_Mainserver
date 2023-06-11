@@ -1,5 +1,10 @@
 # XDP for mainserver
 
+```bash
+# 安装依赖项
+$ sudo apt install clang llvm libelf-dev libpcap-dev gcc-multilib build-essential
+```
+
 使用多个eBPF程序来优化服务器发送文件的过程，以减少数据拷贝和用户态的应用程序介入。
 
 一种可能的实现方式是使用一对XDP（eXpress Data Path）程序，一个用于接收数据包，另一个用于转发数据包。具体流程如下：

@@ -1,4 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* 
+SPDX-License-Identifier: GPL-2.0 
+AF_XDP的内核态程序
+仅仅过滤HTTP GET请求并发送到AF_XDP的用户态程序
+*/
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>

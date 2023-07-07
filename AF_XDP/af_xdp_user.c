@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-
+#define _POSIX_C_SOURCE 199309L
 #include <assert.h>
 #include <errno.h>
 #include <getopt.h>
@@ -290,8 +290,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 *   ICMPV6_ECHO_REPLY
 	 * - Recalculate the icmp checksum */
 
-	if (false) {
-		int ret;
+	int ret;
 		uint32_t tx_idx = 0;
 		uint8_t tmp_mac[ETH_ALEN];
 		struct in6_addr tmp_ip;
@@ -337,9 +336,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 		xsk->stats.tx_bytes += len;
 		xsk->stats.tx_packets++;
 		return true;
-	}
-
-	return false;
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)

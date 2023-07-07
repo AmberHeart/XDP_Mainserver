@@ -67,6 +67,7 @@ trace_load_and_stats
 trace_load_and_stats
 trace_read
 xdp_sample_pkts_user
+.vscode
 
 # configure output
 config.mk

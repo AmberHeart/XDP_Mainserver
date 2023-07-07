@@ -4,6 +4,7 @@
         "ipv6.h": "c",
         "common_libbpf.h": "c",
         "getopt.h": "c",
-        "common_defines.h": "c"
+        "common_defines.h": "c",
+        "common_user_bpf_xdp.h": "c"
     }
 }

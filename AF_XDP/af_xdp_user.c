@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #define _POSIX_C_SOURCE 199309L
+
 #include <assert.h>
 #include <errno.h>
 #include <getopt.h>
@@ -23,8 +24,12 @@
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
-#include <linux/ipv6.h>
-#include <linux/icmpv6.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>  // for TCP header structures and constants
+
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -123,6 +128,7 @@ static const struct option_wrapper long_options[] = {
 };
 
 static bool global_exit;
+
 
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
@@ -276,66 +282,128 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+// 用户态TCP协议栈的核心函数，仅考虑处理HTTP GET请求
+static bool tcp_process(struct xsk_socket_info *xsk, uint8_t *pkt,
+                        uint32_t len, struct ethhdr *eth,
+                        struct iphdr *ip, struct tcphdr *tcp)
+{
+	// 简单假设所有的TCP数据包都是HTTP GET请求
+	if (tcp->syn || tcp->fin || tcp->rst)
+		return false;
+	
+	// 从TCP数据包中提取HTTP GET请求的URL
+	uint8_t *payload = (uint8_t *) (tcp + 1);
+	uint32_t payload_len = len - sizeof(*eth) - sizeof(*ip) - sizeof(*tcp);
+	char *url = NULL;
+	uint32_t url_len = 0;
+	for (int i = 0; i < payload_len - 4; i++) {
+		if (payload[i] == 'G' && payload[i + 1] == 'E' &&
+		    payload[i + 2] == 'T' && payload[i + 3] == ' ') {
+			url = (char *) &payload[i + 4];
+			url_len = payload_len - i - 4;
+			break;
+		}
+	}
+
+	// 生成HTTP响应
+	if (url) {
+		char *resp = "HTTP/1.1 200 OK\r\n"
+			     "Content-Length: 13\r\n"
+			     "Content-Type: text/plain\r\n"
+			     "\r\n"
+			     "Hello, world!";
+		uint32_t resp_len = strlen(resp);
+		uint32_t resp_total_len = resp_len + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
+		uint8_t *resp_pkt = malloc(resp_total_len);
+		if (!resp_pkt)
+			return false;
+
+		// 生成以太网帧头部
+		memcpy(resp_pkt, eth, sizeof(*eth));
+
+		// 生成IP数据包头部
+		struct iphdr *resp_ip = (struct iphdr *) (resp_pkt + sizeof(*eth));
+		memcpy(resp_ip, ip, sizeof(*ip));
+		resp_ip->tot_len = htons(resp_total_len - sizeof(*eth));
+		csum_replace2(&resp_ip->check, htons(payload_len), htons(resp_len));
+
+		// 生成TCP数据包头部
+		struct tcphdr *resp_tcp = (struct tcphdr *) (resp_ip + 1);
+		memcpy(resp_tcp, tcp, sizeof(*tcp));
+		resp_tcp->seq = tcp->ack_seq;
+		resp_tcp->ack_seq = htonl(ntohl(tcp->seq) + payload_len);
+		resp_tcp->doff = sizeof(*resp_tcp) / 4;
+		resp_tcp->syn = 0;
+		resp_tcp->ack = 1;
+		resp_tcp->window = htons(0x2000);
+		csum_replace2(&resp_tcp->check, htons(payload_len), htons(resp_len));
+
+		// 生成HTTP响应的负载
+		memcpy(resp_pkt + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp), resp, resp_len);
+
+		// 将HTTP响应写入到XDP套接字的发送队列
+		uint32_t idx;
+		int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
+		if (ret != 1) {
+			free(resp_pkt);
+			return false;
+		}
+
+		uint64_t addr = xsk->umem_frame_addr[*xsk_ring_prod__fill_addr(&xsk->tx, idx)];
+		memcpy((uint8_t *)
+		xsk_umem__get_data(xsk->umem->buffer, addr), resp_pkt, resp_total_len);
+		xsk_ring_prod__submit(&xsk->tx, resp_total_len);
+		xsk->outstanding_tx++;
+
+		free(resp_pkt);
+		return true;
+
+	} else {
+		return false;
+	}
+}
+
+
+// 用于处理接收到的数据包并生成响应
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-    /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-	 *
-	 * Some assumptions to make it easier:
-	 * - No VLAN handling
-	 * - Only if nexthdr is ICMP
-	 * - Just return all data with MAC/IP swapped, and type set to
-	 *   ICMPV6_ECHO_REPLY
-	 * - Recalculate the icmp checksum */
-
+	 // 根据一些简化的假设处理数据包并生成响应
 	int ret;
-		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
-		struct in6_addr tmp_ip;
-		struct ethhdr *eth = (struct ethhdr *) pkt;
-		struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+	uint32_t tx_idx = 0;
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+	struct iphdr *ip = (struct iphdr *) (eth + 1);
+    struct tcphdr *tcp = (struct tcphdr *) (ip + 1);
 
-		if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-			return false;
+	// 判断数据包是否满足生成响应的条件
+	if (ntohs(eth->h_proto) != ETH_P_IP ||
+        len < (sizeof(*eth) + sizeof(*ip) + sizeof(*tcp)) ||
+        ip->protocol != IPPROTO_TCP)
+        return false;
 
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+	// 处理TCP连接
+    bool handled = tcp_process(xsk, pkt, len, eth, ip, tcp);
 
-		memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+    // 如果TCP连接未被处理，则直接将数据包发送出去
+    if (!handled) {
+        ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+        if (ret != 1) {
+            /* No more transmit slots, drop the packet */
+            return false;
+        }
 
-		icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+        xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+        xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+        xsk_ring_prod__submit(&xsk->tx, 1);
+        xsk->outstanding_tx++;
+    }
 
-		csum_replace2(&icmp->icmp6_cksum,
-			      htons(ICMPV6_ECHO_REQUEST << 8),
-			      htons(ICMPV6_ECHO_REPLY << 8));
-
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-		if (ret != 1) {
-			/* No more transmit slots, drop the packet */
-			return false;
-		}
-
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk->tx, 1);
-		xsk->outstanding_tx++;
-
-		xsk->stats.tx_bytes += len;
-		xsk->stats.tx_packets++;
-		return true;
+	// 更新统计信息
+	xsk->stats.tx_bytes += len;
+	xsk->stats.tx_packets++;
+	return true;
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)
@@ -509,6 +577,7 @@ static void exit_application(int signal)
 
 int main(int argc, char **argv)
 {
+	//变量声明
 	int ret;
 	void *packet_buffer;
 	uint64_t packet_buffer_size;
@@ -521,20 +590,20 @@ int main(int argc, char **argv)
 	int err;
 	char errmsg[1024];
 
-	/* Global shutdown handler */
+	// 注册全局退出处理函数
 	signal(SIGINT, exit_application);
 
-	/* Cmdline options can change progname */
+	// 解析命令行参数
 	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	/* Required option */
+	/* 检查必需的选项 */
 	if (cfg.ifindex == -1) {
 		fprintf(stderr, "ERROR: Required option --dev missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
 	}
 
-	/* Load custom program if configured */
+	/* 加载自定义程序（如果配置了）*/
 	if (cfg.filename[0] != 0) {
 		struct bpf_map *map;
 
@@ -553,13 +622,14 @@ int main(int argc, char **argv)
 			prog = xdp_program__open_file(cfg.filename,
 						  NULL, &opts);
 		}
+		// 检查程序加载错误
 		err = libxdp_get_error(prog);
 		if (err) {
 			libxdp_strerror(err, errmsg, sizeof(errmsg));
 			fprintf(stderr, "ERR: loading program: %s\n", errmsg);
 			return err;
 		}
-
+		// 将程序附加到网络接口
 		err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
 		if (err) {
 			libxdp_strerror(err, errmsg, sizeof(errmsg));
@@ -568,7 +638,7 @@ int main(int argc, char **argv)
 			return err;
 		}
 
-		/* We also need to load the xsks_map */
+		/* 获取 xsks_map */
 		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
 		xsk_map_fd = bpf_map__fd(map);
 		if (xsk_map_fd < 0) {
@@ -578,8 +648,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Allow unlimited locking of memory, so all memory needed for packet
-	 * buffers can be locked.
+	/* 允许无限制地锁定内存，
+	以便可以锁定所有用于数据包缓冲区的内存
 	 */
 	if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
 		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
@@ -587,7 +657,8 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
+	/* 分配用于数据包缓冲区的内存
+	Allocate memory for NUM_FRAMES of the default XDP frame size */
 	packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
 	if (posix_memalign(&packet_buffer,
 			   getpagesize(), /* PAGE_SIZE aligned */
@@ -597,7 +668,7 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Initialize shared packet_buffer for umem usage */
+	/* 初始化 umem */
 	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
 	if (umem == NULL) {
 		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
@@ -605,7 +676,7 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Open and configure the AF_XDP (xsk) socket */
+	/* 配置和打开 AF_XDP（xsk）套接字*/
 	xsk_socket = xsk_configure_socket(&cfg, umem);
 	if (xsk_socket == NULL) {
 		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
@@ -613,7 +684,7 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Start thread to do statistics display */
+	/*启动统计信息显示线程*/
 	if (verbose) {
 		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
 				     xsk_socket);
@@ -624,12 +695,24 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Receive and count packets than drop them */
+	/* 接收和处理数据包 */
 	rx_and_process(&cfg, xsk_socket);
 
-	/* Cleanup */
+	/* 清理资源 */
 	xsk_socket__delete(xsk_socket->xsk);
 	xsk_umem__delete(umem->umem);
 
 	return EXIT_OK;
 }
+/*
+这段代码的主要功能是创建和配置 AF_XDP（xsk）套接字，并使用该套接字接收和处理数据包。它还包括加载和附加自定义的 XDP 程序，设置内存锁定限制，分配缓冲区内存等。以下是每个部分的简要解释：
+
+- 解析命令行参数并检查必需选项。
+- 如果配置了自定义程序，加载并附加该程序到网络接口，并获取 `xsks_map` 的文件描述符。
+- 设置内存锁定的限制，允许锁定足够的内存来存储数据包缓冲区。
+- 分配数据包缓冲区内存并初始化 `umem`（用户态内存）。
+- 配置和打开 AF_XDP（xsk）套接字。
+- 如果启用了详细输出，启动统计信息显示线程。
+- 接收和处理数据包，执行 `rx_and_process` 函数。
+- 清理资源，包括删除套接字和释放内存。
+*/

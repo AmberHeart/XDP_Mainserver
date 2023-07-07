@@ -28,6 +28,7 @@
 #include <linux/tcp.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>  // for TCP header structures and constants
 
 
 #include "./common/common_params.h"
@@ -281,17 +282,89 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
-// 处理TCP连接
-bool handle_tcp_connection(struct tcphdr *tcp, uint32_t payload_len, struct xsk_socket_info *xsk) {
-    // 获取源端口和目标端口
-    uint16_t src_port = ntohs(tcp->source);
-    uint16_t dst_port = ntohs(tcp->dest);
-
-	// 判断是否是SYN包
+// 用户态TCP协议栈的核心函数，仅考虑处理HTTP GET请求
+static bool tcp_process(struct xsk_socket_info *xsk, uint8_t *pkt,
+                        uint32_t len, struct ethhdr *eth,
+                        struct iphdr *ip, struct tcphdr *tcp)
+{
+	// 简单假设所有的TCP数据包都是HTTP GET请求
+	if (tcp->syn || tcp->fin || tcp->rst)
+		return false;
 	
+	// 从TCP数据包中提取HTTP GET请求的URL
+	uint8_t *payload = (uint8_t *) (tcp + 1);
+	uint32_t payload_len = len - sizeof(*eth) - sizeof(*ip) - sizeof(*tcp);
+	char *url = NULL;
+	uint32_t url_len = 0;
+	for (int i = 0; i < payload_len - 4; i++) {
+		if (payload[i] == 'G' && payload[i + 1] == 'E' &&
+		    payload[i + 2] == 'T' && payload[i + 3] == ' ') {
+			url = (char *) &payload[i + 4];
+			url_len = payload_len - i - 4;
+			break;
+		}
+	}
+
+	// 生成HTTP响应
+	if (url) {
+		char *resp = "HTTP/1.1 200 OK\r\n"
+			     "Content-Length: 13\r\n"
+			     "Content-Type: text/plain\r\n"
+			     "\r\n"
+			     "Hello, world!";
+		uint32_t resp_len = strlen(resp);
+		uint32_t resp_total_len = resp_len + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
+		uint8_t *resp_pkt = malloc(resp_total_len);
+		if (!resp_pkt)
+			return false;
+
+		// 生成以太网帧头部
+		memcpy(resp_pkt, eth, sizeof(*eth));
+
+		// 生成IP数据包头部
+		struct iphdr *resp_ip = (struct iphdr *) (resp_pkt + sizeof(*eth));
+		memcpy(resp_ip, ip, sizeof(*ip));
+		resp_ip->tot_len = htons(resp_total_len - sizeof(*eth));
+		csum_replace2(&resp_ip->check, htons(payload_len), htons(resp_len));
+
+		// 生成TCP数据包头部
+		struct tcphdr *resp_tcp = (struct tcphdr *) (resp_ip + 1);
+		memcpy(resp_tcp, tcp, sizeof(*tcp));
+		resp_tcp->seq = tcp->ack_seq;
+		resp_tcp->ack_seq = htonl(ntohl(tcp->seq) + payload_len);
+		resp_tcp->doff = sizeof(*resp_tcp) / 4;
+		resp_tcp->syn = 0;
+		resp_tcp->ack = 1;
+		resp_tcp->window = htons(0x2000);
+		csum_replace2(&resp_tcp->check, htons(payload_len), htons(resp_len));
+
+		// 生成HTTP响应的负载
+		memcpy(resp_pkt + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp), resp, resp_len);
+
+		// 将HTTP响应写入到XDP套接字的发送队列
+		uint32_t idx;
+		int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
+		if (ret != 1) {
+			free(resp_pkt);
+			return false;
+		}
+
+		uint64_t addr = xsk->umem_frame_addr[*xsk_ring_prod__fill_addr(&xsk->tx, idx)];
+		memcpy((uint8_t *)
+		xsk_umem__get_data(xsk->umem->buffer, addr), resp_pkt, resp_total_len);
+		xsk_ring_prod__submit(&xsk->tx, resp_total_len);
+		xsk->outstanding_tx++;
+
+		free(resp_pkt);
+		return true;
+
+	} else {
+		return false;
+	}
 }
 
-// 处理TCP数据包
+
+// 用于处理接收到的数据包并生成响应
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -300,8 +373,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	 // 根据一些简化的假设处理数据包并生成响应
 	int ret;
 	uint32_t tx_idx = 0;
-	uint8_t tmp_mac[ETH_ALEN];
-	struct in6_addr tmp_ip;
 	struct ethhdr *eth = (struct ethhdr *) pkt;
 	struct iphdr *ip = (struct iphdr *) (eth + 1);
     struct tcphdr *tcp = (struct tcphdr *) (ip + 1);
@@ -312,8 +383,8 @@ static bool process_packet(struct xsk_socket_info *xsk,
         ip->protocol != IPPROTO_TCP)
         return false;
 
-	// 处理TCP连接和生成响应
-    bool handled = handle_tcp_connection(tcp, len - (sizeof(struct ethhdr) + sizeof(struct iphdr)), xsk);
+	// 处理TCP连接
+    bool handled = tcp_process(xsk, pkt, len, eth, ip, tcp);
 
     // 如果TCP连接未被处理，则直接将数据包发送出去
     if (!handled) {

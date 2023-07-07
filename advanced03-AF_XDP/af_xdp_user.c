@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#define _POSIX_C_SOURCE 199309L
 
 #include <assert.h>
 #include <errno.h>
@@ -27,9 +26,9 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 
-#include "./common/common_params.h"
-#include "./common/common_user_bpf_xdp.h"
-#include "./common/common_libbpf.h"
+#include "../common/common_params.h"
+#include "../common/common_user_bpf_xdp.h"
+#include "../common/common_libbpf.h"
 
 #define NUM_FRAMES         4096
 #define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
@@ -124,7 +123,6 @@ static const struct option_wrapper long_options[] = {
 };
 
 static bool global_exit;
-
 
 static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
 {
@@ -515,7 +513,6 @@ static void exit_application(int signal)
 
 int main(int argc, char **argv)
 {
-	//变量声明
 	int ret;
 	void *packet_buffer;
 	uint64_t packet_buffer_size;
@@ -528,13 +525,13 @@ int main(int argc, char **argv)
 	int err;
 	char errmsg[1024];
 
-	// 注册全局退出处理函数
+	/* Global shutdown handler */
 	signal(SIGINT, exit_application);
 
-	// 解析命令行参数
+	/* Cmdline options can change progname */
 	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	/* 检查必需的选项 */
+	/* Required option */
 	if (cfg.ifindex == -1) {
 		fprintf(stderr, "ERROR: Required option --dev missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));

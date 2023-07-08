@@ -287,80 +287,126 @@ static bool tcp_process(struct xsk_socket_info *xsk, uint8_t *pkt,
                         uint32_t len, struct ethhdr *eth,
                         struct iphdr *ip, struct tcphdr *tcp)
 {
-	// 简单假设所有的TCP数据包都是HTTP GET请求
-	if (tcp->syn || tcp->fin || tcp->rst)
-		return false;
+	/*
+	简单假设
+	1. 仅处理HTTP GET请求
+	2. 握手三次后，建立连接
+	3. 客户端发送HTTP GET请求，服务器回复HTTP响应
+	4. 四次挥手后，终止连接
+	*/ 
+	uint32_t idx = 0;
 	
-	// 从TCP数据包中提取HTTP GET请求的URL
-	uint8_t *payload = (uint8_t *) (tcp + 1);
-	uint32_t payload_len = len - sizeof(*eth) - sizeof(*ip) - sizeof(*tcp);
-	char *url = NULL;
-	uint32_t url_len = 0;
-	for (int i = 0; i < payload_len - 4; i++) {
-		if (payload[i] == 'G' && payload[i + 1] == 'E' &&
-		    payload[i + 2] == 'T' && payload[i + 3] == ' ') {
-			url = (char *) &payload[i + 4];
-			url_len = payload_len - i - 4;
-			break;
-		}
-	}
+	// 获取TCP数据包的有效载荷
+	uint8_t *payload = pkt + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
+	uint32_t payload_len = ntohs(ip->tot_len) - sizeof(*ip) - sizeof(*tcp);
 
-	// 生成HTTP响应
-	if (url) {
-		char *resp = "HTTP/1.1 200 OK\r\n"
-			     "Content-Length: 13\r\n"
-			     "Content-Type: text/plain\r\n"
-			     "\r\n"
-			     "Hello, world!";
-		uint32_t resp_len = strlen(resp);
-		uint32_t resp_total_len = resp_len + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp);
-		uint8_t *resp_pkt = malloc(resp_total_len);
-		if (!resp_pkt)
-			return false;
+	// 判断是否为TCP连接建立阶段
+	if (tcp->syn && !tcp->ack) {
+		// 连接建立，发送 SYN+ACK 数据包
+		// 构建 SYN+ACK 数据包头部
+		struct tcphdr syn_ack;
+		memset(&syn_ack, 0, sizeof(syn_ack));
+		syn_ack.source = tcp->dest;
+		syn_ack.dest = tcp->source;
+		syn_ack.seq = tcp->ack_seq;
+		syn_ack.ack_seq = htonl(ntohl(tcp->seq) + 1);
+		syn_ack.doff = sizeof(syn_ack) / 4;
+		syn_ack.syn = 1;
+		syn_ack.ack = 1;
+		syn_ack.window = htons(65535);
+		syn_ack.check = 0;
+		syn_ack.urg_ptr = 0;
 
-		// 生成以太网帧头部
-		memcpy(resp_pkt, eth, sizeof(*eth));
-
-		// 生成IP数据包头部
-		struct iphdr *resp_ip = (struct iphdr *) (resp_pkt + sizeof(*eth));
-		memcpy(resp_ip, ip, sizeof(*ip));
-		resp_ip->tot_len = htons(resp_total_len - sizeof(*eth));
-		csum_replace2(&resp_ip->check, htons(payload_len), htons(resp_len));
-
-		// 生成TCP数据包头部
-		struct tcphdr *resp_tcp = (struct tcphdr *) (resp_ip + 1);
-		memcpy(resp_tcp, tcp, sizeof(*tcp));
-		resp_tcp->seq = tcp->ack_seq;
-		resp_tcp->ack_seq = htonl(ntohl(tcp->seq) + payload_len);
-		resp_tcp->doff = sizeof(*resp_tcp) / 4;
-		resp_tcp->syn = 0;
-		resp_tcp->ack = 1;
-		resp_tcp->window = htons(0x2000);
-		csum_replace2(&resp_tcp->check, htons(payload_len), htons(resp_len));
-
-		// 生成HTTP响应的负载
-		memcpy(resp_pkt + sizeof(*eth) + sizeof(*ip) + sizeof(*tcp), resp, resp_len);
-
-		// 将HTTP响应写入到XDP套接字的发送队列
-		uint32_t idx;
-		int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
+		// 发送 SYN+ACK 数据包
+		uint32_t ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
 		if (ret != 1) {
-			free(resp_pkt);
 			return false;
 		}
-
-		uint64_t addr = xsk->umem_frame_addr[*xsk_ring_prod__fill_addr(&xsk->tx, idx)];
-		memcpy((uint8_t *)
-		xsk_umem__get_data(xsk->umem->buffer, addr), resp_pkt, resp_total_len);
-		xsk_ring_prod__submit(&xsk->tx, resp_total_len);
+		uint8_t *ack_pkt = pkt + sizeof(*eth) + sizeof(*ip);
+		memcpy(ack_pkt, &syn_ack, sizeof(syn_ack));
+		*xsk_ring_prod__fill_addr(&xsk->tx, idx) = ack_pkt;
+		xsk_ring_prod__submit(&xsk->tx, 1);
 		xsk->outstanding_tx++;
+		// 更新统计信息
+		xsk->stats.tx_bytes += len;
+		xsk->stats.tx_packets++;
 
-		free(resp_pkt);
+		// 连接建立成功
 		return true;
-
-	} else {
-		return false;
 	}
+
+	// 判断是否为TCP连接终止阶段
+	if (tcp->fin && tcp->ack) {
+		// 连接终止，发送 FIN+ACK 数据包
+		// 构建 FIN+ACK 数据包头部
+		struct tcphdr fin_ack;
+		memset(&fin_ack, 0, sizeof(fin_ack));
+		fin_ack.source = tcp->dest;
+		fin_ack.dest = tcp->source;
+		fin_ack.seq = tcp->ack_seq;
+		fin_ack.ack_seq = htonl(ntohl(tcp->seq) + 1);
+		fin_ack.doff = sizeof(fin_ack) / 4;
+		fin_ack.fin = 1;
+		fin_ack.ack = 1;
+		fin_ack.window = htons(65535);
+		fin_ack.check = 0;
+		fin_ack.urg_ptr = 0;
+
+		// 发送 FIN+ACK 数据包
+		uint32_t ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
+		if (ret != 1) {
+			return false;
+		}
+		uint8_t *fin_ack_pkt = pkt + sizeof(*eth) + sizeof(*ip);
+		memcpy(fin_ack_pkt, &fin_ack, sizeof(fin_ack));
+		*xsk_ring_prod__fill_addr(&xsk->tx, idx) = fin_ack_pkt;
+		xsk_ring_prod__submit(&xsk->tx, 1);
+		xsk->outstanding_tx++;
+		// 更新统计信息
+		xsk->stats.tx_bytes += len;
+		xsk->stats.tx_packets++;
+		// 连接终止成功
+		return true;
+	}
+
+	// 判断是否为HTTP GET请求
+	if (payload_len >= 4 && !memcmp(payload, "GET", 3)) {
+		// HTTP GET 请求，发送 HTTP 响应
+		// 生成 HTTP 响应
+		char *http_response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, world!";
+		uint32_t http_response_len = strlen(http_response);
+
+		// 构建 HTTP 响应数据包头部
+		struct tcphdr http_ack;
+		memset(&http_ack, 0, sizeof(http_ack));
+		http_ack.source = tcp->dest;
+		http_ack.dest = tcp->source;
+		http_ack.seq = tcp->ack_seq;
+		http_ack.ack_seq = htonl(ntohl(tcp->seq) + payload_len);
+		http_ack.doff = sizeof(http_ack) / 4;
+		http_ack.ack = 1;
+		http_ack.window = htons(65535);
+		http_ack.check = 0;
+		http_ack.urg_ptr = 0;
+
+		// 发送 HTTP 响应数据包
+		uint32_t ret = xsk_ring_prod__reserve(&xsk->tx, 1, &idx);
+		if (ret != 1) {
+			return false;
+		}
+		uint8_t *http_ack_pkt = pkt + sizeof(*eth) + sizeof(*ip);
+		memcpy(http_ack_pkt, &http_ack, sizeof(http_ack));
+		memcpy(http_ack_pkt + sizeof(http_ack), http_response, http_response_len);
+		*xsk_ring_prod__fill_addr(&xsk->tx, idx) = http_ack_pkt;
+		xsk_ring_prod__submit(&xsk->tx, 1);
+		xsk->outstanding_tx++;
+		// 更新统计信息
+		xsk->stats.tx_bytes += len;
+		xsk->stats.tx_packets++;
+	}
+
+	// 无需生成响应
+	return false;
 }
 
 
